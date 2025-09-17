@@ -9,6 +9,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import re
+from mangum import Mangum
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -152,17 +158,20 @@ async def recommend(request: RecommendRequest):
         recommender = NewsRecommender(num_epochs=20)
         recommender.build_user_profile(request.saved_news)
 
-        NEWS_API_KEY = "4c0c19e6cad4422a8a177baf5a64ded3"
+        NEWS_API_KEY = os.getenv("NEWS_API_KEY", "4c0c19e6cad4422a8a177baf5a64ded3")  # Безопасно
         candidate_news_list = []
         for category in recommender.categories:
-            url = f"https://newsapi.org/v2/top-headlines?category={category}&apiKey={NEWS_API_KEY}"
+            url = f"https://newsapi.org/v2/top-headlines?category={category}&language=en&pageSize=20&apiKey={NEWS_API_KEY}"
             response = requests.get(url)
+            logger.info(f"Fetched {category} news: status {response.status_code}")
             if response.status_code == 200:
-                articles = response.json()["articles"]
+                data = response.json()
+                articles = data.get("articles", [])
+                logger.info(f"Got {len(articles)} articles for {category}")
                 for article in articles:
                     candidate_news_list.append(NewsItem(
-                        title=article.get("title"),
-                        description=article.get("description"),
+                        title=article.get("title") or "No title",
+                        description=article.get("description") or "No description",
                         category=category,
                         url=article.get("url"),
                         publishedAt=article.get("publishedAt"),
@@ -173,7 +182,10 @@ async def recommend(request: RecommendRequest):
         if not candidate_news_list:
             raise HTTPException(status_code=500, detail="No candidate news fetched from NewsAPI")
 
-        recommendations = recommender.recommend_news(candidate_news_list, top_k=20)
+        recommendations = recommender.recommend_news(candidate_news_list, top_k=30)
         return [rec.dict() for rec in recommendations]
     except Exception as e:
+        logger.error(f"Error in recommend: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+handler = Mangum(app)
