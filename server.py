@@ -1,22 +1,22 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests
+import feedparser
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.feature_extraction.text import TfidfVectorizer
+from transformers import BertTokenizer, BertModel
 from sklearn.metrics.pairwise import cosine_similarity
 import re
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://192.168.100.45:8000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,40 +34,35 @@ class NewsItem(BaseModel):
 class RecommendRequest(BaseModel):
     saved_news: list[NewsItem]
 
-class Autoencoder(nn.Module):
-    def __init__(self, input_dim, embedding_dim=32):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, 16),
-            nn.ReLU()
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(16, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, input_dim),
-            nn.Sigmoid()
-        )
 
-    def forward(self, x):
-        latent = self.encoder(x)
-        reconstructed = self.decoder(latent)
-        return reconstructed, latent
+class GlobalRecommender:
+    def __init__(self):
+        logger.info("Loading BERT model and tokenizer... (this may take 1-2 minutes)")
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-uncased')
+        self.bert_model = BertModel.from_pretrained('bert-base-multilingual-uncased')
+        self.bert_model.eval()
+        if torch.cuda.is_available():
+            self.bert_model = self.bert_model.cuda()
+            logger.info("BERT moved to GPU")
+        else:
+            logger.info("BERT running on CPU")
 
-class NewsRecommender:
-    def __init__(self, num_categories=7, embedding_dim=32, num_epochs=50, lr=0.001):
-        self.num_categories = num_categories
-        self.embedding_dim = embedding_dim
-        self.num_epochs = num_epochs
-        self.lr = lr
-        self.autoencoder = None
-        self.user_profile = None
+        self.num_categories = 7
         self.categories = ['general', 'business', 'entertainment', 'health', 'science', 'sports', 'technology']
         self.moods = ['happy', 'sad', 'neutral']
-        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
         self.category_to_idx = {cat: idx for idx, cat in enumerate(self.categories)}
         self.mood_to_idx = {mood: idx for idx, mood in enumerate(self.moods)}
+
+        self.rss_feeds = {
+            'general': 'https://feeds.bbci.co.uk/news/rss.xml',
+            'business': 'https://feeds.bbci.co.uk/news/business/rss.xml',
+            'entertainment': 'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
+            'health': 'https://feeds.bbci.co.uk/news/health/rss.xml',
+            'science': 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+            'sports': 'https://feeds.bbci.co.uk/sport/rss.xml',
+            'technology': 'https://feeds.bbci.co.uk/news/technology/rss.xml'
+        }
+        logger.info("Global recommender initialized")
 
     def preprocess_text(self, text):
         if not text:
@@ -75,22 +70,30 @@ class NewsRecommender:
         text = re.sub(r'\W', ' ', text.lower())
         return ' '.join(text.split())
 
-    def extract_features(self, news_list, fit_vectorizer=True):
-        texts, categories, moods = [], [], []
+    def extract_bert_embedding(self, text):
+        inputs = self.tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self.bert_model(**inputs)
+            embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+        return embedding
+
+    def extract_features(self, news_list):
+        embeddings, categories, moods = [], [], []
         for news in news_list:
             title = news.title or ''
             desc = news.description or ''
-            full_text = self.preprocess_text(title + ' ' + desc)
-            texts.append(full_text)
+            cont = news.content or ''
+            full_text = self.preprocess_text(title + ' ' + desc + ' ' + cont)
+            embedding = self.extract_bert_embedding(full_text)
+            embeddings.append(embedding)
             cat = news.category or 'general'
             categories.append(cat)
             mood = self.analyze_mood(full_text)
             moods.append(mood)
 
-        if fit_vectorizer:
-            tfidf_matrix = self.vectorizer.fit_transform(texts).toarray()
-        else:
-            tfidf_matrix = self.vectorizer.transform(texts).toarray()
+        embeddings = np.array(embeddings)
 
         cat_onehot = np.zeros((len(news_list), self.num_categories))
         mood_onehot = np.zeros((len(news_list), len(self.moods)))
@@ -100,11 +103,13 @@ class NewsRecommender:
             if mood in self.mood_to_idx:
                 mood_onehot[i, self.mood_to_idx[mood]] = 1
 
-        return np.hstack([tfidf_matrix, cat_onehot, mood_onehot])
+        return np.hstack([embeddings, cat_onehot, mood_onehot])
 
     def analyze_mood(self, text):
-        positive_keywords = {"happy", "joy", "success", "growth", "love", "peace", "hope", "celebration", "beautiful", "good news"}
-        negative_keywords = {"sad", "grief", "fear", "crisis", "death", "loss", "war", "failure", "decline", "negative", "bad"}
+        positive_keywords = {"happy", "joy", "success", "growth", "love", "peace", "hope", "celebration", "beautiful",
+                             "good news"}
+        negative_keywords = {"sad", "grief", "fear", "crisis", "death", "loss", "war", "failure", "decline", "negative",
+                             "bad"}
         text_lower = text.lower()
         if any(kw in text_lower for kw in positive_keywords):
             return "happy"
@@ -118,72 +123,51 @@ class NewsRecommender:
 
         features = self.extract_features(saved_news_list)
         features = (features - features.mean(axis=0)) / (features.std(axis=0) + 1e-8)
+        self.user_profile = features.mean(axis=0)
 
-        dataset = TensorDataset(torch.FloatTensor(features))
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-        input_dim = features.shape[1]
-        self.autoencoder = Autoencoder(input_dim, self.embedding_dim)
-
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(self.autoencoder.parameters(), lr=self.lr)
-
-        self.autoencoder.train()
-        for _ in range(self.num_epochs):
-            for batch_features, in dataloader:
-                optimizer.zero_grad()
-                reconstructed, _ = self.autoencoder(batch_features)
-                loss = criterion(reconstructed, batch_features)
-                loss.backward()
-                optimizer.step()
-
-        with torch.no_grad():
-            _, latent = self.autoencoder(torch.FloatTensor(features))
-            self.user_profile = latent.mean(dim=0).numpy()
+    def fetch_candidates_from_rss(self):
+        candidate_news_list = []
+        for category, rss_url in self.rss_feeds.items():
+            try:
+                feed = feedparser.parse(rss_url)
+                for entry in feed.entries[:20]:
+                    candidate_news_list.append(NewsItem(
+                        title=entry.get('title'),
+                        description=entry.get('summary'),
+                        category=category,
+                        url=entry.get('link'),
+                        publishedAt=entry.get('published'),
+                        urlToImage=entry.get('media_content', [{}])[0].get('url') if 'media_content' in entry else None,
+                        content=entry.get('content', [{}])[0].get('value') if 'content' in entry else None
+                    ))
+            except Exception as e:
+                logger.error(f"Error fetching RSS for {category}: {e}")
+        return candidate_news_list
 
     def recommend_news(self, candidate_news_list, top_k=10):
         if self.user_profile is None:
             raise ValueError("Build user profile first.")
 
-        cand_features = self.extract_features(candidate_news_list, fit_vectorizer=False)
+        cand_features = self.extract_features(candidate_news_list)
         cand_features = (cand_features - cand_features.mean(axis=0)) / (cand_features.std(axis=0) + 1e-8)
 
-        with torch.no_grad():
-            _, latent_cand = self.autoencoder(torch.FloatTensor(cand_features))
-            latent_cand = latent_cand.numpy()
-
-        similarities = cosine_similarity([self.user_profile], latent_cand)[0]
+        similarities = cosine_similarity([self.user_profile], cand_features)[0]
         top_indices = np.argsort(similarities)[::-1][:top_k]
         return [candidate_news_list[i] for i in top_indices]
+
+global_recommender = GlobalRecommender()
 
 @app.post("/recommend")
 async def recommend(request: RecommendRequest):
     try:
-        recommender = NewsRecommender(num_epochs=20)
-        recommender.build_user_profile(request.saved_news)
-
-        NEWS_API_KEY = "4c0c19e6cad4422a8a177baf5a64ded3"
-        candidate_news_list = []
-        for category in recommender.categories:
-            url = f"https://newsapi.org/v2/top-headlines?category={category}&apiKey={NEWS_API_KEY}"
-            response = requests.get(url)
-            if response.status_code == 200:
-                articles = response.json()["articles"]
-                for article in articles:
-                    candidate_news_list.append(NewsItem(
-                        title=article.get("title"),
-                        description=article.get("description"),
-                        category=category,
-                        url=article.get("url"),
-                        publishedAt=article.get("publishedAt"),
-                        urlToImage=article.get("urlToImage"),
-                        content=article.get("content")
-                    ))
+        global_recommender.build_user_profile(request.saved_news)
+        candidate_news_list = global_recommender.fetch_candidates_from_rss()
 
         if not candidate_news_list:
-            raise HTTPException(status_code=500, detail="No candidate news fetched from NewsAPI")
+            raise HTTPException(status_code=500, detail="No candidate news fetched from RSS feeds")
 
-        recommendations = recommender.recommend_news(candidate_news_list, top_k=20)
+        recommendations = global_recommender.recommend_news(candidate_news_list, top_k=20)
         return [rec.dict() for rec in recommendations]
     except Exception as e:
+        logger.error(f"Error in /recommend: {e}")
         raise HTTPException(status_code=500, detail=str(e))
